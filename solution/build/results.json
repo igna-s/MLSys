@@ -1,0 +1,26 @@
+{
+  "mlsys-2026-1.json": {
+    "score": 91691.2,
+    "subgraphs": 1
+  },
+  "mlsys-2026-13.json": {
+    "score": 423362.5599999986,
+    "subgraphs": 5
+  },
+  "mlsys-2026-17.json": {
+    "score": 767764.48,
+    "subgraphs": 29
+  },
+  "mlsys-2026-5.json": {
+    "score": 190075.10833333308,
+    "subgraphs": 2
+  },
+  "mlsys-2026-9.json": {
+    "score": 3129991.999999951,
+    "subgraphs": 2
+  },
+  "TOTAL": {
+    "score": 4602885.348333282,
+    "under_10m": true
+  }
+}
