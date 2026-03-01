@@ -184,40 +184,39 @@ static Best find_best(const Problem&p,const std::vector<size_t>&ops,
         for(auto t:op.outputs){tensor_dims.insert(p.tensors[t].width);tensor_dims.insert(p.tensors[t].height);}
     }
 
-    // Generate granularity candidates: focused set
+    // Generate granularity candidates: compact set (capped for speed)
     auto gen=[&](int64_t nat, int64_t mx) -> std::vector<int64_t> {
         std::set<int64_t> s;
-        // Powers of 2 from 16 up to mx
-        for(int64_t v=16;v<=mx&&v<=8192;v*=2) s.insert(v);
-        // Nat and its multiples (up to mx)
-        for(int64_t m=1;m*nat<=mx&&m*nat<=8192;++m) s.insert(m*nat);
-        // Divisors of output that are multiples of nat or >=16
-        if(mx>0){
-            // Only add divisors that are multiples of min(nat,16)
-            int64_t step = std::min(nat, (int64_t)16);
-            for(int64_t d=step;d<=mx;d+=step){
-                if(mx%d==0) s.insert(d);
-            }
+        // Powers of 2 from nat down to 16
+        for(int64_t v=nat;v>=16;v/=2) s.insert(v);
+        // Powers of 2 up from nat
+        for(int64_t v=nat*2;v<=mx&&v<=8192;v*=2) s.insert(v);
+        // Key multiples of nat: 1x, 2x, 4x, 8x
+        for(int64_t m : {1,2,3,4,8}) {
+            if(m*nat<=mx&&m*nat<=8192) s.insert(m*nat);
         }
-        // Also add divisors of each tensor dim that align well  
-        for(int64_t td:tensor_dims){
-            if(td<=0||td>8192) continue;
-            for(int64_t d=nat;d<=td;d+=nat) {
-                if(td%d==0 && d<=mx) s.insert(d);
-            }
+        // The output dimension itself and its half
+        if(mx>=16) s.insert(mx);
+        if(mx/2>=16) s.insert(mx/2);
+        // Divisors of mx that are multiples of nat (fast: only check nat multiples)
+        for(int64_t d=nat;d<=mx;d+=nat){
+            if(mx%d==0) s.insert(d);
         }
         return std::vector<int64_t>(s.begin(),s.end());
     };
     auto ws=gen(nw,oW),hs=gen(nh,oH);
 
-    // K candidates: focused set
+    // K candidates: compact set
     std::vector<int64_t> ks;
     if(has_mm&&K>0){
         std::set<int64_t> kset;
-        for(int64_t v=K;v>=16;v/=2)kset.insert(v);
-        // Also add multiples of native dims that divide K
-        for(int64_t m=1;m*nw<=K;++m)if(K%(m*nw)==0)kset.insert(m*nw);
-        for(int64_t m=1;m*nh<=K;++m)if(K%(m*nh)==0)kset.insert(m*nh);
+        // Powers of 2 down from K
+        for(int64_t v=K;v>=16;v/=2) kset.insert(v);
+        // Key multiples of nat that divide K
+        for(int64_t m : {1,2,4,8,16,32}) {
+            int64_t v=m*nw; if(v>=16&&v<=K&&K%v==0) kset.insert(v);
+            v=m*nh; if(v>=16&&v<=K&&K%v==0) kset.insert(v);
+        }
         ks.assign(kset.begin(),kset.end());
     }else{
         ks={1};
@@ -261,8 +260,14 @@ Solution Solve(const Problem&problem){
     std::vector<Info>info(N+1);
     dp[0]=0;
 
-    // Adaptive window: wider for reasonable sizes, cap to avoid explosion
-    int W = std::min(16, N);
+    // Adaptive window: balance quality vs speed
+    int W;
+    if(N<=20) W=std::min(14,N);
+    else if(N<=40) W=std::min(12,N);
+    else W=std::min(10,N);
+
+    // Adaptive retention modes: fewer for large problems
+    int num_rmodes = (N<=40) ? 4 : 2;
 
     for(int i=1;i<=N;++i){
         for(int j=std::max(0,i-W);j<i;++j){
@@ -271,8 +276,8 @@ Solution Solve(const Problem&problem){
             std::set<size_t>res;
             if(j>0&&par[j]>=0)for(auto t:info[j].ret)res.insert(t);
 
-            // 4 retention strategies
-            for(int rmode=0;rmode<4;++rmode){
+            // Retention strategies (adaptive count)
+            for(int rmode=0;rmode<num_rmodes;++rmode){
                 std::vector<size_t>rl;std::set<size_t>rs;
                 int sg_last=i-1;
 
