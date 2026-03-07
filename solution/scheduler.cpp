@@ -9,6 +9,7 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <map>
+#include <chrono>
 
 namespace mlsys_solver {
 
@@ -72,7 +73,6 @@ static EvalResult eval_inner(
         for(auto t:op.outputs){produced.insert(t);all_t.insert(t);}
     }
 
-    // Ephemeral: produced AND consumed in subgraph, last_use within subgraph, NOT a graph output
     std::set<size_t> eph;
     for(size_t t:produced) {
         if(consumed.count(t) && last_use[t]<=sg_last && !gi.graph_outputs.count(t))
@@ -94,7 +94,6 @@ static EvalResult eval_inner(
     int64_t cols=ceildiv(outW,gw),rows=ceildiv(outH,gh),tiles=cols*rows;
     int64_t ksteps=(has_mm&&K_dim>0&&gk>0)?ceildiv(K_dim,gk):1;
 
-    // Working set calculation with PER-TENSOR K dimensions
     int64_t ws_stream=0, ws_stat=0;
     struct TI{bool lhs,rhs; int64_t sk,sf; bool ld,st; int64_t actual_K;};
     std::vector<TI> bt;
@@ -113,14 +112,12 @@ static EvalResult eval_inner(
         int64_t sk=l?gh*gk:(r?gw*gk:gw*gh);
         int64_t sf=l?gh*actual_K:(r?actual_K*gw:gw*gh);
 
-        // Resident tensors are already in fast memory — don't add their WS
         if(!resident.count(t)) {
             ws_stream+=sk;
             ws_stat+=sf;
         }
 
         bool needs_load = ic && !ip && !resident.count(t);
-        // Retained tensors stay in fast memory for next subgraph — no store needed
         bool needs_store = ip && !retained.count(t) && !resident.count(t);
 
         bt.push_back({l,r,sk,sf,needs_load,needs_store,actual_K});
@@ -130,7 +127,6 @@ static EvalResult eval_inner(
     if(!use_stat&&ws_stream>p.fast_memory_capacity)return{0,false,0};
     if(use_stat&&ws_stat>p.fast_memory_capacity)return{0,false,0};
 
-    // Compute cost with padding
     double pw=0,mm=0;
     for(size_t oi:ops){auto&op=p.ops[oi];
         if(op.op_type=="MatMul")mm+=(double)op.base_cost/ksteps;
@@ -138,12 +134,10 @@ static EvalResult eval_inner(
     double pad=(double)(std::max(gw,nw)*std::max(gh,nh))/(double)(gw*gh);
     pw*=pad;mm*=pad;
 
-    // Memory costs per tile
     double lhs_ld=0,rhs_ld=0,pw_ld=0,st_c=0;
     for(auto&ti:bt){
         double c;
         if(use_stat && ti.lhs) {
-            // In stationary mode, LHS is loaded once (full actual_K dimension)
             c = (double)ti.sf / bw;
         } else {
             c = (double)ti.sk / bw;
@@ -152,9 +146,8 @@ static EvalResult eval_inner(
         if(ti.st)st_c+=(double)(gw*gh)/bw;
     }
 
-    // Analytical latency with snake traversal modeling
     double total=0;
-    bool rs=(smode==0); // row-snake vs col-snake
+    bool rs=(smode==0);
     for(int64_t kk=0;kk<ksteps;++kk){
         double comp=mm;if(kk==0)comp+=pw;
         double lc=use_stat?((kk==0)?lhs_ld:0):lhs_ld;
@@ -162,7 +155,6 @@ static EvalResult eval_inner(
 
         if(has_mm&&tiles>1){
             if(rs){
-                // Row-snake: reuse LHS across columns, reload RHS at row change
                 total+=std::max(comp,lc+rc+pwm+stm);
                 if(cols>1)total+=(cols-1)*std::max(comp,rc+pwm+stm);
                 for(int64_t r=1;r<rows;++r){
@@ -170,7 +162,6 @@ static EvalResult eval_inner(
                     if(cols>1)total+=(cols-1)*std::max(comp,rc+pwm+stm);
                 }
             }else{
-                // Col-snake: reuse RHS across rows, reload LHS at col change
                 total+=std::max(comp,lc+rc+pwm+stm);
                 if(rows>1)total+=(rows-1)*std::max(comp,lc+pwm+stm);
                 for(int64_t c=1;c<cols;++c){
@@ -207,41 +198,29 @@ static Best find_best(const Problem&p,const std::vector<size_t>&ops,
         for(auto t:op.outputs){auto&T=p.tensors[t];if(T.width*T.height>oW*oH){oW=T.width;oH=T.height;}}
     }
 
-    // Collect ALL tensor dimensions in the subgraph for smarter candidate generation
     std::set<int64_t> all_dims;
     for(size_t oi:ops){auto&op=p.ops[oi];
         for(auto t:op.inputs){all_dims.insert(p.tensors[t].width);all_dims.insert(p.tensors[t].height);}
         for(auto t:op.outputs){all_dims.insert(p.tensors[t].width);all_dims.insert(p.tensors[t].height);}
     }
 
-    // Generate dense granularity candidates
     auto gen=[&](int64_t nat, int64_t mx) -> std::vector<int64_t> {
         std::set<int64_t> s;
-
-        // Powers of 2 from 16 up to max
         for(int64_t v=16;v<=mx&&v<=8192;v*=2) s.insert(v);
-
-        // Powers of 2 from nat down to 16
         for(int64_t v=nat;v>=16;v/=2) s.insert(v);
-
-        // Key multiples of nat up to max
-        for(int64_t m : {1,2,3,4,6,8,16}) {
+        for(int64_t m : {1,2,3,4,5,6,7,8,10,12,16}) {
             int64_t v=m*nat;
             if(v>=16&&v<=mx&&v<=8192) s.insert(v);
         }
-
-        // The output dimension itself and fractions
         if(mx>=16) s.insert(mx);
         if(mx/2>=16) s.insert(mx/2);
+        if(mx/3>=16) s.insert(mx/3);
         if(mx/4>=16) s.insert(mx/4);
+        if(mx/6>=16) s.insert(mx/6);
         if(mx/8>=16) s.insert(mx/8);
-
-        // Divisors of mx that are multiples of nat
         for(int64_t d=nat;d<=mx;d+=nat){
             if(mx%d==0) s.insert(d);
         }
-
-        // Divisors of mx >= 16 (thorough search for reasonable sizes)
         if(mx <= 8192) {
             for(int64_t d=16;d*d<=mx;++d){
                 if(mx%d==0){
@@ -251,46 +230,44 @@ static Best find_best(const Problem&p,const std::vector<size_t>&ops,
                 }
             }
         }
-
-        // Also add divisors of OTHER tensor dimensions in the subgraph
-        // This helps when the output dims don't capture all useful tile sizes
         for(int64_t dim : all_dims) {
             if(dim >= 16 && dim <= mx) {
                 s.insert(dim);
-                // And divisors of this dim that also divide mx
                 for(int64_t d=nat;d<=dim&&d<=mx;d+=nat) {
                     if(dim%d==0 && mx%d==0) s.insert(d);
                 }
             }
+            if(dim <= 8192 && dim >= 16) {
+                for(int64_t d=16;d*d<=dim;++d){
+                    if(dim%d==0){
+                        if(d<=mx && mx%d==0) s.insert(d);
+                        int64_t q=dim/d;
+                        if(q>=16 && q<=mx && mx%q==0) s.insert(q);
+                    }
+                }
+            }
         }
-
         return std::vector<int64_t>(s.begin(),s.end());
     };
     auto ws=gen(nw,oW),hs=gen(nh,oH);
 
-    // K candidates: denser set
     std::vector<int64_t> ks;
     if(has_mm&&K>0){
         std::set<int64_t> kset;
-        // Powers of 2 from 16 up to K
         for(int64_t v=16;v<=K;v*=2) kset.insert(v);
-        // K itself
         kset.insert(K);
-        // Key multiples of native dims that divide K
         for(int64_t base : {nw, nh}) {
             for(int64_t m=1;m*base<=K;++m) {
                 int64_t v=m*base;
                 if(v>=16&&K%v==0) kset.insert(v);
             }
         }
-        // Divisors of K >= 16
         for(int64_t d=16;d*d<=K;++d){
             if(K%d==0){
                 kset.insert(d);
                 if(K/d>=16) kset.insert(K/d);
             }
         }
-        // Also add divisors of ALL K dimensions (not just the max)
         for(size_t oi:ops){auto&op=p.ops[oi];
             if(op.op_type=="MatMul"&&op.inputs.size()>=2){
                 int64_t thisK = p.tensors[op.inputs[0]].width;
@@ -318,7 +295,6 @@ static Best find_best(const Problem&p,const std::vector<size_t>&ops,
 
     for(int64_t sw:ws)for(int64_t sh:hs)
         for(int64_t kk:ks)tr(sw,sh,kk);
-    // Asymmetric swap
     for(int64_t sw:hs)for(int64_t sh:ws)
         for(int64_t kk:ks){
             if(std::find(ws.begin(),ws.end(),sw)!=ws.end()&&
@@ -329,31 +305,52 @@ static Best find_best(const Problem&p,const std::vector<size_t>&ops,
     return best;
 }
 
+// V14: Hash a retention set for deduplication
+static uint64_t hash_retention_set(const std::set<size_t>& rs) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for(size_t t : rs) {
+        h ^= t;
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
 Solution Solve(const Problem&problem){
     int N=problem.ops.size();
     GraphInfo gi = build_graph_info(problem);
 
-    // Build first-use / last-use maps
     std::vector<int>fu(problem.tensors.size(),-1),lu(problem.tensors.size(),-1);
     for(int s=0;s<N;++s){auto&op=problem.ops[s];
         for(auto t:op.inputs){if(fu[t]==-1)fu[t]=s;lu[t]=s;}
         for(auto t:op.outputs){if(fu[t]==-1)fu[t]=s;lu[t]=s;}}
+
+    // V14: Static DP configs — proven W sizes + dedup for speed
+    // Modes 0-9 available, but limit count for time budget
+    // Note: Windows is ~2x slower than Linux contest machine
+    int W;
+    int num_rmodes;
+    if(N<=32) {
+        W=N;  // Fully exhaustive for small problems
+        num_rmodes=10;  // All modes — B9 needs budget-free modes 7/8
+    } else if(N<=40) {
+        W=std::min(16,N);
+        num_rmodes=10;
+    } else if(N<=65) {
+        W=std::min(12,N);
+        num_rmodes=6;  // Modes 0-5 cover the key strategies
+    } else if(N<=105) {
+        W=std::min(10,N);
+        num_rmodes=5;
+    } else {
+        W=std::min(8,N);
+        num_rmodes=4;
+    }
 
     std::vector<double>dp(N+1,1e30);
     std::vector<int>par(N+1,-1);
     struct Info{int64_t w,h,k;std::vector<int64_t>tr;double lat;std::vector<size_t>ret;};
     std::vector<Info>info(N+1);
     dp[0]=0;
-
-    // Wider adaptive DP window — must cover full transformer blocks (4 ops)
-    int W;
-    if(N<=20) W=std::min(20,N);
-    else if(N<=40) W=std::min(16,N);
-    else if(N<=80) W=std::min(12,N);
-    else W=std::min(10,N);
-
-    // Number of retention modes
-    int num_rmodes = (N<=50) ? 9 : 3;
 
     for(int i=1;i<=N;++i){
         for(int j=std::max(0,i-W);j<i;++j){
@@ -362,13 +359,14 @@ Solution Solve(const Problem&problem){
             std::set<size_t>res;
             if(j>0&&par[j]>=0)for(auto t:info[j].ret)res.insert(t);
 
-            // Multiple retention strategies
+            // V14: Deduplication
+            std::set<uint64_t> seen_hashes;
+
             for(int rmode=0;rmode<num_rmodes;++rmode){
                 std::vector<size_t>rl;std::set<size_t>rs;
                 int sg_last=i-1;
 
                 if(rmode==0){
-                    // Retain all used-later tensors, largest first
                     std::set<size_t>sg_t;
                     for(size_t oi:ol){for(auto t:problem.ops[oi].outputs)sg_t.insert(t);
                                       for(auto t:problem.ops[oi].inputs)sg_t.insert(t);}
@@ -384,7 +382,6 @@ Solution Solve(const Problem&problem){
                     // Retain nothing
                 }
                 else if(rmode==2){
-                    // Retain only tensors used in the NEXT few ops (forward-looking)
                     std::set<size_t>sg_t;
                     for(size_t oi:ol){for(auto t:problem.ops[oi].outputs)sg_t.insert(t);
                                       for(auto t:problem.ops[oi].inputs)sg_t.insert(t);}
@@ -404,7 +401,6 @@ Solution Solve(const Problem&problem){
                     for(auto&c:rc)if(bud>=c.s){rl.push_back(c.i);rs.insert(c.i);bud-=c.s;}
                 }
                 else if(rmode==3){
-                    // Retain the single largest reusable tensor
                     std::set<size_t>sg_t;
                     for(size_t oi:ol){for(auto t:problem.ops[oi].outputs)sg_t.insert(t);
                                       for(auto t:problem.ops[oi].inputs)sg_t.insert(t);}
@@ -418,7 +414,6 @@ Solution Solve(const Problem&problem){
                     }
                 }
                 else if(rmode==4){
-                    // Retain the smallest reusable tensor
                     std::set<size_t>sg_t;
                     for(size_t oi:ol){for(auto t:problem.ops[oi].outputs)sg_t.insert(t);
                                       for(auto t:problem.ops[oi].inputs)sg_t.insert(t);}
@@ -432,7 +427,6 @@ Solution Solve(const Problem&problem){
                     }
                 }
                 else if(rmode==5){
-                    // Retain ALL small reusable tensors (threshold: 25% of fast memory)
                     std::set<size_t>sg_t;
                     for(size_t oi:ol){for(auto t:problem.ops[oi].outputs)sg_t.insert(t);
                                       for(auto t:problem.ops[oi].inputs)sg_t.insert(t);}
@@ -448,7 +442,6 @@ Solution Solve(const Problem&problem){
                     for(auto&c:rc)if(bud>=c.s){rl.push_back(c.i);rs.insert(c.i);bud-=c.s;}
                 }
                 else if(rmode==6){
-                    // Retain all reusable tensors with generous budget
                     std::set<size_t>sg_t;
                     for(size_t oi:ol){for(auto t:problem.ops[oi].outputs)sg_t.insert(t);
                                       for(auto t:problem.ops[oi].inputs)sg_t.insert(t);}
@@ -463,15 +456,12 @@ Solution Solve(const Problem&problem){
                         if(next_use>=0)
                             rc.push_back({t,problem.tensors[t].width*problem.tensors[t].height,next_use});
                     }
-                    // Sort by soonest use first
                     std::sort(rc.begin(),rc.end(),[](const RC&a,const RC&b){return a.nu<b.nu;});
                     int64_t bud=problem.fast_memory_capacity;
                     for(auto&c:rc)if(bud>=c.s){rl.push_back(c.i);rs.insert(c.i);bud-=c.s;}
                 }
                 else if(rmode==7){
-                    // BUDGET-FREE: Retain ALL used-later tensors unconditionally.
-                    // The WS check in eval_inner handles validity, since retention
-                    // only needs per-tile strip memory, not the full tensor.
+                    // BUDGET-FREE: Retain ALL used-later tensors unconditionally
                     std::set<size_t>sg_t;
                     for(size_t oi:ol){for(auto t:problem.ops[oi].outputs)sg_t.insert(t);
                                       for(auto t:problem.ops[oi].inputs)sg_t.insert(t);}
@@ -493,6 +483,29 @@ Solution Solve(const Problem&problem){
                         if(near){rl.push_back(t);rs.insert(t);}
                     }
                 }
+                else if(rmode==9){
+                    std::set<size_t>sg_t;
+                    for(size_t oi:ol){for(auto t:problem.ops[oi].outputs)sg_t.insert(t);
+                                      for(auto t:problem.ops[oi].inputs)sg_t.insert(t);}
+                    struct RC{size_t i;int64_t s;int nu;};
+                    std::vector<RC>rc;
+                    for(size_t t:sg_t)if(lu[t]>sg_last){
+                        int next_use=-1;
+                        for(int k2=i;k2<std::min(N,i+6);++k2){
+                            for(auto t2:problem.ops[k2].inputs)if(t2==t){next_use=k2;break;}
+                            if(next_use>=0)break;
+                        }
+                        if(next_use>=0)
+                            rc.push_back({t,problem.tensors[t].width*problem.tensors[t].height,next_use});
+                    }
+                    std::sort(rc.begin(),rc.end(),[](const RC&a,const RC&b){return a.nu<b.nu;});
+                    int64_t bud=problem.fast_memory_capacity/2;
+                    for(auto&c:rc)if(bud>=c.s){rl.push_back(c.i);rs.insert(c.i);bud-=c.s;}
+                }
+
+                // V14: Deduplicate
+                uint64_t rh = hash_retention_set(rs);
+                if(!seen_hashes.insert(rh).second) continue;
 
                 auto br=find_best(problem,ol,res,rs,lu,gi);
                 if(!br.valid)continue;

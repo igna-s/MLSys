@@ -1,0 +1,8 @@
+build/
+*.exe
+*.pdb
+*.o
+*.obj
+output_*.json
+*.txt
+__pycache__/
