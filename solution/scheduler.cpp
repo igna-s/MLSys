@@ -1,7 +1,7 @@
 #include "scheduler.h"
 #include <algorithm>
 #include <cmath>
-#include <limits>
+#include <climits>
 #include <numeric>
 #include <set>
 #include <vector>
@@ -10,6 +10,10 @@
 #include <unordered_map>
 #include <map>
 #include <chrono>
+#include <tuple>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace mlsys_solver {
 
@@ -283,24 +287,44 @@ static Best find_best(const Problem&p,const std::vector<size_t>&ops,
         ks={1};
     }
 
-    Best best;best.valid=false;best.lat=1e30;
-    auto tr=[&](int64_t sw,int64_t sh,int64_t sk){
-        auto ev=eval(p,ops,sw,sh,sk,res,ret,lu,sl,gi);
-        if(ev.valid&&ev.latency<best.lat){
-            best.lat=ev.latency;best.w=sw;best.h=sh;best.k=sk;best.valid=true;
-            int64_t cs=ceildiv(oW,sw),rs_=ceildiv(oH,sh);
-            best.tr=(cs*rs_>1)?((ev.snake==0)?make_snake(cs,rs_):make_col_snake(cs,rs_)):std::vector<int64_t>{};
-        }
-    };
-
+    // Flatten all (w, h, k) combos into a single vector for parallel iteration
+    std::vector<std::tuple<int64_t,int64_t,int64_t>> combos;
+    combos.reserve(ws.size()*hs.size()*ks.size()*2);
     for(int64_t sw:ws)for(int64_t sh:hs)
-        for(int64_t kk:ks)tr(sw,sh,kk);
+        for(int64_t kk:ks) combos.emplace_back(sw,sh,kk);
+    // Transposed combos (swap w/h axes)
     for(int64_t sw:hs)for(int64_t sh:ws)
         for(int64_t kk:ks){
             if(std::find(ws.begin(),ws.end(),sw)!=ws.end()&&
                std::find(hs.begin(),hs.end(),sh)!=hs.end())continue;
-            tr(sw,sh,kk);
+            combos.emplace_back(sw,sh,kk);
         }
+
+    Best best;best.valid=false;best.lat=1e30;
+    int64_t combo_n=(int64_t)combos.size();
+
+    #pragma omp parallel
+    {
+        // Each thread has its own local best to avoid any data races
+        Best local_best;local_best.valid=false;local_best.lat=1e30;
+
+        #pragma omp for schedule(dynamic,4) nowait
+        for(int64_t ci=0;ci<combo_n;++ci){
+            auto [sw,sh,sk]=combos[ci];
+            auto ev=eval(p,ops,sw,sh,sk,res,ret,lu,sl,gi);
+            if(ev.valid&&ev.latency<local_best.lat){
+                local_best.lat=ev.latency;local_best.w=sw;local_best.h=sh;local_best.k=sk;local_best.valid=true;
+                int64_t cs=ceildiv(oW,sw),rs_=ceildiv(oH,sh);
+                local_best.tr=(cs*rs_>1)?((ev.snake==0)?make_snake(cs,rs_):make_col_snake(cs,rs_)):std::vector<int64_t>{};
+            }
+        }
+
+        // Thread-safe reduction: merge thread-local best into global best
+        #pragma omp critical
+        {
+            if(local_best.valid&&local_best.lat<best.lat) best=local_best;
+        }
+    }
 
     return best;
 }
@@ -359,20 +383,36 @@ Solution Solve(const Problem&problem){
             std::set<size_t>res;
             if(j>0&&par[j]>=0)for(auto t:info[j].ret)res.insert(t);
 
-            // V14: Deduplication
-            std::set<uint64_t> seen_hashes;
+            // V14: Parallel retention modes — each mode runs independently
+            int sg_last_common=i-1;
 
+            // Pre-build common tensor set for all rmodes (read-only)
+            std::set<size_t> sg_tensors;
+            for(size_t oi:ol){
+                for(auto t:problem.ops[oi].outputs)sg_tensors.insert(t);
+                for(auto t:problem.ops[oi].inputs)sg_tensors.insert(t);
+            }
+
+            // Thread-local result struct
+            struct RModeResult {
+                double tot;  // dp[j] + best latency
+                int64_t w,h,k;
+                std::vector<int64_t> tr;
+                double lat;
+                std::vector<size_t> ret;
+                bool valid;
+            };
+            std::vector<RModeResult> rmode_results(num_rmodes);
+            for(int rm=0;rm<num_rmodes;++rm) rmode_results[rm].valid=false;
+
+            #pragma omp parallel for schedule(dynamic,1)
             for(int rmode=0;rmode<num_rmodes;++rmode){
                 std::vector<size_t>rl;std::set<size_t>rs;
-                int sg_last=i-1;
 
                 if(rmode==0){
-                    std::set<size_t>sg_t;
-                    for(size_t oi:ol){for(auto t:problem.ops[oi].outputs)sg_t.insert(t);
-                                      for(auto t:problem.ops[oi].inputs)sg_t.insert(t);}
                     struct RC{size_t i;int64_t s;};
                     std::vector<RC>rc;
-                    for(size_t t:sg_t)if(lu[t]>sg_last)
+                    for(size_t t:sg_tensors)if(lu[t]>sg_last_common)
                         rc.push_back({t,problem.tensors[t].width*problem.tensors[t].height});
                     std::sort(rc.begin(),rc.end(),[](const RC&a,const RC&b){return a.s>b.s;});
                     int64_t bud=problem.fast_memory_capacity;
@@ -382,12 +422,9 @@ Solution Solve(const Problem&problem){
                     // Retain nothing
                 }
                 else if(rmode==2){
-                    std::set<size_t>sg_t;
-                    for(size_t oi:ol){for(auto t:problem.ops[oi].outputs)sg_t.insert(t);
-                                      for(auto t:problem.ops[oi].inputs)sg_t.insert(t);}
                     struct RC{size_t i;int64_t s;int nu;};
                     std::vector<RC>rc;
-                    for(size_t t:sg_t)if(lu[t]>sg_last){
+                    for(size_t t:sg_tensors)if(lu[t]>sg_last_common){
                         int next_use=-1;
                         for(int k2=i;k2<std::min(N,i+8);++k2){
                             for(auto t2:problem.ops[k2].inputs)if(t2==t){next_use=k2;break;}
@@ -401,11 +438,8 @@ Solution Solve(const Problem&problem){
                     for(auto&c:rc)if(bud>=c.s){rl.push_back(c.i);rs.insert(c.i);bud-=c.s;}
                 }
                 else if(rmode==3){
-                    std::set<size_t>sg_t;
-                    for(size_t oi:ol){for(auto t:problem.ops[oi].outputs)sg_t.insert(t);
-                                      for(auto t:problem.ops[oi].inputs)sg_t.insert(t);}
                     size_t best_t=0;int64_t best_s=0;bool found=false;
-                    for(size_t t:sg_t)if(lu[t]>sg_last){
+                    for(size_t t:sg_tensors)if(lu[t]>sg_last_common){
                         int64_t s=problem.tensors[t].width*problem.tensors[t].height;
                         if(s>best_s){best_s=s;best_t=t;found=true;}
                     }
@@ -414,11 +448,8 @@ Solution Solve(const Problem&problem){
                     }
                 }
                 else if(rmode==4){
-                    std::set<size_t>sg_t;
-                    for(size_t oi:ol){for(auto t:problem.ops[oi].outputs)sg_t.insert(t);
-                                      for(auto t:problem.ops[oi].inputs)sg_t.insert(t);}
                     size_t best_t=0;int64_t best_s=INT64_MAX;bool found=false;
-                    for(size_t t:sg_t)if(lu[t]>sg_last){
+                    for(size_t t:sg_tensors)if(lu[t]>sg_last_common){
                         int64_t s=problem.tensors[t].width*problem.tensors[t].height;
                         if(s<best_s&&s>0){best_s=s;best_t=t;found=true;}
                     }
@@ -427,13 +458,10 @@ Solution Solve(const Problem&problem){
                     }
                 }
                 else if(rmode==5){
-                    std::set<size_t>sg_t;
-                    for(size_t oi:ol){for(auto t:problem.ops[oi].outputs)sg_t.insert(t);
-                                      for(auto t:problem.ops[oi].inputs)sg_t.insert(t);}
                     struct RC{size_t i;int64_t s;};
                     std::vector<RC>rc;
                     int64_t thresh=problem.fast_memory_capacity/4;
-                    for(size_t t:sg_t)if(lu[t]>sg_last){
+                    for(size_t t:sg_tensors)if(lu[t]>sg_last_common){
                         int64_t s=problem.tensors[t].width*problem.tensors[t].height;
                         if(s<=thresh) rc.push_back({t,s});
                     }
@@ -442,12 +470,9 @@ Solution Solve(const Problem&problem){
                     for(auto&c:rc)if(bud>=c.s){rl.push_back(c.i);rs.insert(c.i);bud-=c.s;}
                 }
                 else if(rmode==6){
-                    std::set<size_t>sg_t;
-                    for(size_t oi:ol){for(auto t:problem.ops[oi].outputs)sg_t.insert(t);
-                                      for(auto t:problem.ops[oi].inputs)sg_t.insert(t);}
                     struct RC{size_t i;int64_t s;int nu;};
                     std::vector<RC>rc;
-                    for(size_t t:sg_t)if(lu[t]>sg_last){
+                    for(size_t t:sg_tensors)if(lu[t]>sg_last_common){
                         int next_use=-1;
                         for(int k2=i;k2<std::min(N,i+12);++k2){
                             for(auto t2:problem.ops[k2].inputs)if(t2==t){next_use=k2;break;}
@@ -462,19 +487,13 @@ Solution Solve(const Problem&problem){
                 }
                 else if(rmode==7){
                     // BUDGET-FREE: Retain ALL used-later tensors unconditionally
-                    std::set<size_t>sg_t;
-                    for(size_t oi:ol){for(auto t:problem.ops[oi].outputs)sg_t.insert(t);
-                                      for(auto t:problem.ops[oi].inputs)sg_t.insert(t);}
-                    for(size_t t:sg_t)if(lu[t]>sg_last){
+                    for(size_t t:sg_tensors)if(lu[t]>sg_last_common){
                         rl.push_back(t);rs.insert(t);
                     }
                 }
                 else if(rmode==8){
                     // BUDGET-FREE: Retain only tensors used in the next few ops
-                    std::set<size_t>sg_t;
-                    for(size_t oi:ol){for(auto t:problem.ops[oi].outputs)sg_t.insert(t);
-                                      for(auto t:problem.ops[oi].inputs)sg_t.insert(t);}
-                    for(size_t t:sg_t)if(lu[t]>sg_last){
+                    for(size_t t:sg_tensors)if(lu[t]>sg_last_common){
                         bool near=false;
                         for(int k2=i;k2<std::min(N,i+8);++k2){
                             for(auto t2:problem.ops[k2].inputs)if(t2==t){near=true;break;}
@@ -484,12 +503,9 @@ Solution Solve(const Problem&problem){
                     }
                 }
                 else if(rmode==9){
-                    std::set<size_t>sg_t;
-                    for(size_t oi:ol){for(auto t:problem.ops[oi].outputs)sg_t.insert(t);
-                                      for(auto t:problem.ops[oi].inputs)sg_t.insert(t);}
                     struct RC{size_t i;int64_t s;int nu;};
                     std::vector<RC>rc;
-                    for(size_t t:sg_t)if(lu[t]>sg_last){
+                    for(size_t t:sg_tensors)if(lu[t]>sg_last_common){
                         int next_use=-1;
                         for(int k2=i;k2<std::min(N,i+6);++k2){
                             for(auto t2:problem.ops[k2].inputs)if(t2==t){next_use=k2;break;}
@@ -503,16 +519,20 @@ Solution Solve(const Problem&problem){
                     for(auto&c:rc)if(bud>=c.s){rl.push_back(c.i);rs.insert(c.i);bud-=c.s;}
                 }
 
-                // V14: Deduplicate
-                uint64_t rh = hash_retention_set(rs);
-                if(!seen_hashes.insert(rh).second) continue;
-
+                // Each thread evaluates its rmode's retention set independently
                 auto br=find_best(problem,ol,res,rs,lu,gi);
-                if(!br.valid)continue;
+                if(!br.valid) continue;
                 double tot=dp[j]+br.lat;
-                if(tot<dp[i]){
-                    dp[i]=tot;par[i]=j;
-                    info[i]={br.w,br.h,br.k,br.tr,br.lat,rl};
+                rmode_results[rmode]={tot,br.w,br.h,br.k,br.tr,br.lat,rl,true};
+            }
+
+            // Sequential reduction: pick best across all retention modes
+            for(int rmode=0;rmode<num_rmodes;++rmode){
+                if(!rmode_results[rmode].valid) continue;
+                auto& r=rmode_results[rmode];
+                if(r.tot<dp[i]){
+                    dp[i]=r.tot;par[i]=j;
+                    info[i]={r.w,r.h,r.k,r.tr,r.lat,r.ret};
                 }
             }
         }

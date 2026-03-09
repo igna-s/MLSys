@@ -18,7 +18,7 @@ COPY main.cpp scheduler.cpp scheduler.h ./
 COPY nlohmann/ ./nlohmann/
 
 # Compilar estáticamente con optimizaciones
-RUN g++ -O3 -std=c++20 -static \
+RUN g++ -O3 -std=c++20 -static -fopenmp \
     -I. \
     main.cpp scheduler.cpp \
     -o mlsys \
