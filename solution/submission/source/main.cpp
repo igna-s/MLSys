@@ -36,6 +36,7 @@ Problem ReadProblem(const std::string& filename) {
     for (size_t i = 0; i < inputs.size(); ++i) {
         Op op;
         op.op_type = op_types[i];
+        op.op_type_enum = (op.op_type == "MatMul") ? OpType::MatMul : OpType::Pointwise;
         op.base_cost = base_costs[i];
         
         for (auto in : inputs[i]) op.inputs.push_back(in);

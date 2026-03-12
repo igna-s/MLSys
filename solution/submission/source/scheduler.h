@@ -22,8 +22,11 @@ struct Tensor {
     int64_t size() const { return width * height; }
 };
 
+enum class OpType : uint8_t { Pointwise = 0, MatMul = 1 };
+
 struct Op {
     std::string op_type;
+    OpType op_type_enum;
     std::vector<size_t> inputs;
     std::vector<size_t> outputs;
     BaseCost base_cost;
