@@ -78,7 +78,6 @@ struct SubgraphTensorInfo {
     struct TInfo {
         size_t tensor_id;
         bool lhs, rhs;
-        bool pw_use;  // V16: also used as Pointwise input/output
         int64_t actual_K;
         bool is_consumed_not_produced; // ic && !ip
         bool is_produced;              // ip
@@ -157,7 +156,7 @@ static SubgraphTensorInfo precompute_sg_tensors(
     for (size_t t : all_t_vec) {
         if (si.eph.count(t)) continue;
         bool ip = si.produced.count(t), ic = si.consumed.count(t);
-        bool l = false, r = false, pw = false;
+        bool l = false, r = false;
         int64_t actual_K = si.K_dim;
         for (size_t oi : ops) {
             auto& op = p.ops[oi];
@@ -165,13 +164,8 @@ static SubgraphTensorInfo precompute_sg_tensors(
                 if (op.inputs[0] == t) { l = true; actual_K = p.tensors[t].width; }
                 if (op.inputs[1] == t) { r = true; actual_K = p.tensors[t].height; }
             }
-            // V16: detect Pointwise usage for multi-role tensors
-            if (op.op_type_enum == OpType::Pointwise) {
-                for (auto ti : op.inputs) if (ti == t) pw = true;
-                for (auto to : op.outputs) if (to == t) pw = true;
-            }
         }
-        si.tinfos.push_back({t, l, r, pw, actual_K, ic && !ip, ip});
+        si.tinfos.push_back({t, l, r, actual_K, ic && !ip, ip});
     }
 
     return si;
@@ -185,8 +179,7 @@ static EvalResult eval_inner_precomp(
     const SubgraphTensorInfo& si,
     int64_t gw, int64_t gh, int64_t gk,
     const TensorSet& resident, const TensorSet& retained,
-    int smode,
-    int64_t resident_full_size
+    int smode
 ) {
     int64_t nw = p.native_granularity.width, nh = p.native_granularity.height;
     double bw = std::max(1.0, (double)p.slow_memory_bandwidth);
@@ -197,54 +190,37 @@ static EvalResult eval_inner_precomp(
     int64_t ksteps = (si.has_mm && si.K_dim > 0 && gk > 0) ? ceildiv(si.K_dim, gk) : 1;
 
     // Pass 1: compute workspace sizes for feasibility check
-    // V16: for multi-role tensors (MatMul LHS/RHS + Pointwise), use max slice size
     int64_t ws_stream = 0, ws_stat = 0;
     for (auto& ti : si.tinfos) {
         int64_t sk = ti.lhs ? gh * gk : (ti.rhs ? gw * gk : gw * gh);
         int64_t sf = ti.lhs ? gh * ti.actual_K : (ti.rhs ? ti.actual_K * gw : gw * gh);
-        // If tensor is used as both MatMul input AND Pointwise input/output,
-        // it needs the larger of the two slice sizes
-        if (ti.pw_use && (ti.lhs || ti.rhs)) {
-            sk = std::max(sk, gw * gh);
-            sf = std::max(sf, gw * gh);
-        }
         if (!resident.count(ti.tensor_id)) {
             ws_stream += sk;
             ws_stat += sf;
         }
     }
 
-    // V16: Account for resident tensors (retained from previous subgraph) in OOM check
-    int64_t avail = p.fast_memory_capacity - resident_full_size;
-    if (avail <= 0) return {0, false, 0};
-    bool use_stat = ksteps > 1 && ws_stat <= avail;
-    if (!use_stat && ws_stream > avail) return {0, false, 0};
-    if (use_stat && ws_stat > avail) return {0, false, 0};
+    bool use_stat = ksteps > 1 && ws_stat <= p.fast_memory_capacity;
+    if (!use_stat && ws_stream > p.fast_memory_capacity) return {0, false, 0};
+    if (use_stat && ws_stat > p.fast_memory_capacity) return {0, false, 0};
 
     // Pass 2: compute memory transfer costs
     double lhs_ld = 0, rhs_ld = 0, pw_ld = 0, st_c = 0;
     for (auto& ti : si.tinfos) {
         int64_t sk = ti.lhs ? gh * gk : (ti.rhs ? gw * gk : gw * gh);
         int64_t sf = ti.lhs ? gh * ti.actual_K : (ti.rhs ? ti.actual_K * gw : gw * gh);
-        // V16: multi-role tensor transfer cost
-        if (ti.pw_use && (ti.lhs || ti.rhs)) {
-            sk = std::max(sk, gw * gh);
-            sf = std::max(sf, gw * gh);
-        }
 
         bool needs_load = ti.is_consumed_not_produced && !resident.count(ti.tensor_id);
         bool needs_store = ti.is_produced && !retained.count(ti.tensor_id) && !resident.count(ti.tensor_id);
 
         double c;
-        if (use_stat && ti.lhs && !ti.pw_use) {
+        if (use_stat && ti.lhs) {
             c = (double)sf / bw;
         } else {
             c = (double)sk / bw;
         }
         if (needs_load) {
-            // V16: multi-role tensors categorized as Pointwise (larger slice dominates)
-            if (ti.pw_use && (ti.lhs || ti.rhs)) pw_ld += c;
-            else if (ti.lhs) lhs_ld += c;
+            if (ti.lhs) lhs_ld += c;
             else if (ti.rhs) rhs_ld += c;
             else pw_ld += c;
         }
@@ -290,11 +266,10 @@ static EvalResult eval_inner_precomp(
 static EvalResult eval_precomp(const Problem& p,
     const SubgraphTensorInfo& si,
     int64_t gw, int64_t gh, int64_t gk,
-    const TensorSet& res, const TensorSet& ret,
-    int64_t resident_full_size)
+    const TensorSet& res, const TensorSet& ret)
 {
-    auto r0 = eval_inner_precomp(p, si, gw, gh, gk, res, ret, 0, resident_full_size);
-    auto r1 = eval_inner_precomp(p, si, gw, gh, gk, res, ret, 1, resident_full_size);
+    auto r0 = eval_inner_precomp(p, si, gw, gh, gk, res, ret, 0);
+    auto r1 = eval_inner_precomp(p, si, gw, gh, gk, res, ret, 1);
     if (r0.valid && r1.valid) return r0.latency <= r1.latency ? r0 : r1;
     return r0.valid ? r0 : r1;
 }
@@ -416,12 +391,6 @@ static Best find_best(const Problem& p, const std::vector<size_t>& ops,
             combos.emplace_back(sw, sh, kk);
         }
 
-    // V16: Precompute total size of resident tensors (retained from previous subgraph)
-    int64_t resident_full_size = 0;
-    for (size_t t = 0; t < p.tensors.size(); ++t) {
-        if (res.count(t)) resident_full_size += p.tensors[t].size();
-    }
-
     Best best; best.valid = false; best.lat = 1e30;
     int64_t combo_n = (int64_t)combos.size();
 
@@ -432,7 +401,7 @@ static Best find_best(const Problem& p, const std::vector<size_t>& ops,
         #pragma omp for schedule(dynamic, 4) nowait
         for (int64_t ci = 0; ci < combo_n; ++ci) {
             auto [sw, sh, sk] = combos[ci];
-            auto ev = eval_precomp(p, si, sw, sh, sk, res, ret, resident_full_size);
+            auto ev = eval_precomp(p, si, sw, sh, sk, res, ret);
             if (ev.valid && ev.latency < local_best.lat) {
                 local_best.lat = ev.latency; local_best.w = sw; local_best.h = sh; local_best.k = sk; local_best.valid = true;
                 int64_t cs = ceildiv(oW, sw), rs_ = ceildiv(oH, sh);
@@ -623,37 +592,19 @@ Solution Solve(const Problem& problem) {
                     for (auto& c : rc) if (bud >= c.s) { rl.push_back(c.i); rs.insert(c.i); bud -= c.s; }
                 }
                 else if (rmode == 7) {
-                    // V16: retain all future-use tensors, sorted smallest first, with capacity check
-                    struct RC { size_t i; int64_t s; };
-                    std::vector<RC> rc;
-                    for (size_t t : sg_tensors_vec) if (lu[t] > sg_last_common)
-                        rc.push_back({t, problem.tensors[t].width * problem.tensors[t].height});
-                    std::sort(rc.begin(), rc.end(), [](const RC& a, const RC& b) { return a.s < b.s; });
-                    int64_t bud = problem.fast_memory_capacity;
-                    for (auto& c : rc) if (bud >= c.s) { rl.push_back(c.i); rs.insert(c.i); bud -= c.s; }
+                    for (size_t t : sg_tensors_vec) if (lu[t] > sg_last_common) {
+                        rl.push_back(t); rs.insert(t);
+                    }
                 }
                 else if (rmode == 8) {
-                    // V16: retain near-future tensors with capacity check
-                    struct RC { size_t i; int64_t s; int nu; };
-                    std::vector<RC> rc;
                     for (size_t t : sg_tensors_vec) if (lu[t] > sg_last_common) {
                         bool near = false;
                         for (int k2 = i; k2 < std::min(N, i + 8); ++k2) {
                             for (auto t2 : problem.ops[k2].inputs) if (t2 == t) { near = true; break; }
                             if (near) break;
                         }
-                        if (near) {
-                            int next_use = -1;
-                            for (int k2 = i; k2 < std::min(N, i + 8); ++k2) {
-                                for (auto t2 : problem.ops[k2].inputs) if (t2 == t) { next_use = k2; break; }
-                                if (next_use >= 0) break;
-                            }
-                            rc.push_back({t, problem.tensors[t].width * problem.tensors[t].height, next_use});
-                        }
+                        if (near) { rl.push_back(t); rs.insert(t); }
                     }
-                    std::sort(rc.begin(), rc.end(), [](const RC& a, const RC& b) { return a.nu < b.nu; });
-                    int64_t bud = problem.fast_memory_capacity;
-                    for (auto& c : rc) if (bud >= c.s) { rl.push_back(c.i); rs.insert(c.i); bud -= c.s; }
                 }
                 else if (rmode == 9) {
                     struct RC { size_t i; int64_t s; int nu; };
@@ -705,14 +656,10 @@ Solution Solve(const Problem& problem) {
                 rmode_results[rmode] = {tot, br.w, br.h, br.k, br.tr, br.lat, ret_lists[rmode], true};
             }
 
-            // V16: Sequential reduction with retained-size safety check
+            // Sequential reduction
             for (int rmode = 0; rmode < num_rmodes; ++rmode) {
                 if (!rmode_results[rmode].valid) continue;
                 auto& r = rmode_results[rmode];
-                // Safety: verify retained tensors fit in fast memory
-                int64_t ret_size = 0;
-                for (auto t : r.ret) ret_size += problem.tensors[t].width * problem.tensors[t].height;
-                if (ret_size > problem.fast_memory_capacity) continue; // skip invalid retention
                 if (r.tot < dp[i]) {
                     dp[i] = r.tot; par[i] = j;
                     info[i] = {r.w, r.h, r.k, r.tr, r.lat, r.ret};
