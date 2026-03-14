@@ -5,15 +5,23 @@ Runs V10, V14, V15 binaries under competition conditions (8 cores, Ubuntu 22.04)
 and validates outputs per competition rules + reports latency scores.
 
 Checks performed:
-  1. Valid JSON output with all required fields
-  2. All ops in the DAG are covered by at least one subgraph
-  3. Topological ordering within subgraphs is correct
-  4. Granularity values are positive integers
-  5. Tensor indices in tensors_to_retain are valid
-  6. Working set fits in fast_memory_capacity (OOM check)
-  7. Retained tensors fit in fast memory between subgraphs
-  8. Graph outputs end up in slow memory (not retained at end)
-  9. Timeout enforcement per competition table
+  1.  Valid JSON output with all required fields
+  2.  All ops in the DAG are covered by at least one subgraph
+  3.  No duplicate ops within the same subgraph
+  4.  Topological ordering within subgraphs is correct
+  5.  Inter-subgraph data flow: each op's inputs produced in an earlier or same subgraph
+  6.  Granularity values are positive integers
+  7.  Tensor indices in tensors_to_retain are valid
+  8.  Joint working set fits in fast_memory_capacity (OOM check)
+       - MatMul LHS: full K loaded once per tile (widths[lhs]*h), not a k-strip
+       - MatMul RHS: w*k strip per k-step
+       - Ephemeral MatMul outputs: zero capacity (pass-through)
+       - All non-ephemeral outputs: w*h each
+       - Previously retained tensors coexist, not double-counted
+  9.  Retained tensors fit in fast memory between subgraphs
+  10. Graph outputs end up in slow memory (not retained at end)
+  11. Timeout enforcement per competition table
+  12. Reported latencies verified against roofline model (warnings only)
 """
 
 import json
@@ -32,7 +40,7 @@ TIMEOUTS = {
     "mlsys-2026-17": 60, "mlsys-2026-18": 60, "mlsys-2026-19": 60, "mlsys-2026-20": 60,
 }
 
-VERSIONS = ["v10", "v14", "v15", "v16"]
+VERSIONS = ["v10", "v16", "v17"]
 CORE_CONFIGS = [1, 8]  # Run each version with 1 core and 8 cores
 BIN_DIR = "/app/bin"
 BENCH_DIR = "/app/benchmarks"
@@ -132,10 +140,41 @@ def validate_solution(problem, solution):
             errors.append(f"Subgraph {i}: granularity values must be positive: [{w},{h},{k}]")
 
     # --- Check tensor indices in tensors_to_retain ---
+    # Per PROBLEM.md: only output tensors or loaded inputs of the subgraph
+    # (or previously retained tensors) may be retained.
     for i, retain in enumerate(tensors_to_retain):
+        sg_ops_set = set(subgraphs[i]) if i < len(subgraphs) else set()
+        # Tensors accessible in fast memory during this subgraph:
+        #  - outputs of ops in this subgraph
+        #  - inputs loaded by ops in this subgraph (non-ephemeral, non-graph-output)
+        #  - previously retained tensors
+        accessible = set()
+        for op_id in sg_ops_set:
+            for t_id in outputs_list[op_id]:
+                accessible.add(t_id)
+            for t_id in inputs_list[op_id]:
+                accessible.add(t_id)
+        if i > 0:
+            accessible |= set(tensors_to_retain[i - 1])
         for t_id in retain:
             if t_id < 0 or t_id >= num_tensors:
                 errors.append(f"Subgraph {i}: invalid tensor index in tensors_to_retain: {t_id}")
+            elif t_id not in accessible:
+                errors.append(
+                    f"Subgraph {i}: tensor {t_id} in tensors_to_retain was not "
+                    f"produced, loaded, or previously retained by this subgraph"
+                )
+
+    # --- Check for duplicate ops within the same subgraph ---
+    for sg_idx, sg_ops in enumerate(subgraphs):
+        seen = set()
+        dups = []
+        for op_id in sg_ops:
+            if op_id in seen:
+                dups.append(op_id)
+            seen.add(op_id)
+        if dups:
+            errors.append(f"Subgraph {sg_idx}: contains duplicate ops: {sorted(set(dups))}")
 
     # --- Check topological ordering within subgraphs ---
     for sg_idx, sg_ops in enumerate(subgraphs):
@@ -151,80 +190,140 @@ def validate_solution(problem, solution):
                             f"but op {prod_op} appears at position {op_pos[prod_op]} >= {op_pos[op_id]}"
                         )
 
+    # --- Check inter-subgraph data flow consistency ---
+    # For each op C in subgraph i, every input tensor must be either:
+    #   (a) a graph input (not produced by any op), or
+    #   (b) produced by an op scheduled in some earlier subgraph j < i, or
+    #   (c) produced by an op earlier in the same subgraph (covered by topo check above).
+    op_first_sg = {}  # op_id -> earliest subgraph index where it is scheduled
+    for sg_idx, sg_ops in enumerate(subgraphs):
+        for op_id in sg_ops:
+            if op_id not in op_first_sg:
+                op_first_sg[op_id] = sg_idx
+
+    for sg_idx, sg_ops in enumerate(subgraphs):
+        op_set = set(sg_ops)
+        for op_id in sg_ops:
+            for t_id in inputs_list[op_id]:
+                if t_id not in tensor_producer:
+                    continue  # graph input — always available from slow memory
+                prod_op = tensor_producer[t_id]
+                if prod_op in op_set:
+                    continue  # same subgraph — topological order check handles this
+                earliest = op_first_sg.get(prod_op)
+                if earliest is None or earliest >= sg_idx:
+                    errors.append(
+                        f"Subgraph {sg_idx}: op {op_id} needs tensor {t_id} "
+                        f"produced by op {prod_op}, but op {prod_op} is not "
+                        f"scheduled before subgraph {sg_idx}"
+                    )
+
+    # --- Validate traversal_orders ---
+    for sg_idx, (sg_ops, trav, gran) in enumerate(zip(subgraphs, traversal_orders, granularities)):
+        if trav is None:
+            continue
+        if len(gran) != 3:
+            continue
+        w, h, k = gran
+        if w <= 0 or h <= 0:
+            continue
+        # Determine number of spatial tiles from the tensors touched by this subgraph
+        # Use the first output tensor of the first op to get the output dimensions
+        max_W, max_H = 0, 0
+        for op_id in sg_ops:
+            for t_id in outputs_list[op_id]:
+                max_W = max(max_W, widths[t_id])
+                max_H = max(max_H, heights[t_id])
+        if max_W == 0 or max_H == 0:
+            continue
+        n_tiles_w = math.ceil(max_W / w)
+        n_tiles_h = math.ceil(max_H / h)
+        n_tiles = n_tiles_w * n_tiles_h
+        if len(trav) != n_tiles:
+            errors.append(
+                f"Subgraph {sg_idx}: traversal_order length ({len(trav)}) != "
+                f"expected number of tiles ({n_tiles} = {n_tiles_w}x{n_tiles_h})"
+            )
+        elif sorted(trav) != list(range(n_tiles)):
+            errors.append(
+                f"Subgraph {sg_idx}: traversal_order is not a valid permutation of [0..{n_tiles-1}]"
+            )
+
     # --- OOM / Working Set Check ---
-    # For each subgraph, verify the working set fits in fast_memory_capacity.
-    # Working set = sum of input slices + output slices for a single execution tile.
+    # Compute the JOINT working set across all ops in the subgraph tile.
+    # Peak footprint occurs on the first k-step:
+    #   - MatMul LHS: full K dimension loaded ONCE per spatial tile (widths[lhs]*h),
+    #     then stays resident for all subsequent k-steps (bandwidth 0 on mid-steps).
+    #     This matches PROBLEM.md Example 5 where Tensor0 (128x128) is kept resident.
+    #   - MatMul RHS: w*k strip loaded every k-step.
+    #   - MatMul output (non-ephemeral): w*h accumulator always in fast memory.
+    #   - MatMul output (ephemeral): passes directly to next op — zero capacity.
+    #     (Example 5: Tensor3 ephemeral intermediate is NOT in the 40960 working set.)
+    #   - Pointwise inputs/outputs (non-ephemeral): w*h each.
+    #   - Previously retained tensors already occupy fast memory and are NOT
+    #     double-counted in the joint working set.
     for sg_idx, sg_ops in enumerate(subgraphs):
         if sg_idx >= len(granularities) or len(granularities[sg_idx]) != 3:
             continue
         w, h, k = granularities[sg_idx]
-        op_set = set(sg_ops)
 
         # Identify ephemeral tensors (produced AND consumed within subgraph, not graph output)
+        # External consumers don't prevent ephemeral status — they're served
+        # by tensors_to_retain (if retained) or recomputation (if discarded).
         ephemeral = set()
         for op_id in sg_ops:
             for t_id in outputs_list[op_id]:
                 if t_id in graph_outputs:
                     continue
-                # Check if all consumers are within this subgraph
-                all_consumers_in_sg = True
-                for op2 in range(num_ops):
-                    if op2 not in op_set and t_id in inputs_list[op2]:
-                        all_consumers_in_sg = False
-                        break
-                if all_consumers_in_sg:
-                    # Check if at least one consumer exists in subgraph
-                    has_consumer_in_sg = any(
-                        t_id in inputs_list[op2] for op2 in sg_ops if op2 != op_id
-                    )
-                    if has_consumer_in_sg:
-                        ephemeral.add(t_id)
+                has_consumer_in_sg = any(
+                    t_id in inputs_list[op2] for op2 in sg_ops if op2 != op_id
+                )
+                if has_consumer_in_sg:
+                    ephemeral.add(t_id)
 
-        # Calculate working set for each op in the subgraph
-        # The worst-case working set is the max across all ops
-        max_working_set = 0
+        prev_retain_set = set(tensors_to_retain[sg_idx - 1]) if sg_idx > 0 else set()
+        prev_retained_size = sum(widths[t] * heights[t] for t in prev_retain_set)
+
+        # Collect unique boundary tensors across all ops for the joint working set.
+        matmul_lhs = {}  # t_id -> True: non-ephemeral, non-retained MatMul LHS
+        matmul_rhs = {}  # t_id -> True: non-ephemeral, non-retained MatMul RHS
+        pw_inputs = {}   # t_id -> True: non-ephemeral, non-retained Pointwise inputs
+        out_tiles = {}   # t_id -> True: non-ephemeral outputs (accumulator or pointwise)
+
         for op_id in sg_ops:
-            ws = 0
             if op_types[op_id] == "MatMul":
-                # LHS input slice: k x h
-                # RHS input slice: w x k
-                # Output slice: w x h
-                for t_id in inputs_list[op_id]:
-                    if t_id in ephemeral:
-                        continue  # ephemeral = 0 capacity
-                    # First input = LHS (height=h, width=k), Second = RHS (height=k, width=w)
                 lhs_t = inputs_list[op_id][0]
                 rhs_t = inputs_list[op_id][1]
-                if lhs_t not in ephemeral:
-                    ws += k * h  # LHS slice
-                if rhs_t not in ephemeral:
-                    ws += w * k  # RHS slice
+                if lhs_t not in ephemeral and lhs_t not in prev_retain_set:
+                    matmul_lhs[lhs_t] = True
+                if rhs_t not in ephemeral and rhs_t not in prev_retain_set:
+                    matmul_rhs[rhs_t] = True
                 for t_id in outputs_list[op_id]:
                     if t_id not in ephemeral:
-                        ws += w * h  # output slice
-            else:
-                # Pointwise: all inputs and outputs are w x h
+                        out_tiles[t_id] = True  # non-ephemeral accumulator only
+            else:  # Pointwise
                 for t_id in inputs_list[op_id]:
-                    if t_id not in ephemeral:
-                        ws += w * h
+                    if t_id not in ephemeral and t_id not in prev_retain_set:
+                        pw_inputs[t_id] = True
                 for t_id in outputs_list[op_id]:
                     if t_id not in ephemeral:
-                        ws += w * h
+                        out_tiles[t_id] = True
 
-            max_working_set = max(max_working_set, ws)
+        # Joint working set (peak, during first k-step of a spatial tile)
+        joint_ws = 0
+        for t_id in matmul_lhs:
+            joint_ws += widths[t_id] * h   # full K dimension, loaded once per tile
+        for _t in matmul_rhs:
+            joint_ws += w * k               # RHS strip per k-step
+        for _t in pw_inputs:
+            joint_ws += w * h               # pointwise input, loaded once per tile
+        for _t in out_tiles:
+            joint_ws += w * h               # output slice / accumulator in fast memory
 
-        # Also add retained tensors from previous subgraph that are still resident
-        # (retained tensors occupy space alongside the working set)
-        # The retained tensors have their full size, not sliced
+        total_ws = joint_ws + prev_retained_size
+
+        # Check: retained tensors after this subgraph alone fit in fast memory
         retain_set = set(tensors_to_retain[sg_idx]) if sg_idx < len(tensors_to_retain) else set()
-
-        # Tensors retained FROM PREVIOUS subgraph that are used as inputs here
-        # They occupy their slice size in the working set (already counted above)
-        # But tensors retained that are NOT used in this subgraph still occupy full space
-        # Actually per the problem: retained tensors stay in fast memory but working set
-        # is about the execution tile. The retained tensors should not exceed capacity either.
-
-        # Check: retained tensors after this subgraph fit
         retained_size = sum(widths[t] * heights[t] for t in retain_set)
         if retained_size > fast_mem:
             errors.append(
@@ -232,21 +331,23 @@ def validate_solution(problem, solution):
                 f"exceed fast memory ({fast_mem})"
             )
 
-        if max_working_set > fast_mem:
+        # Check: joint working set + previously retained tensors must fit
+        if total_ws > fast_mem:
             errors.append(
-                f"Subgraph {sg_idx}: working set ({max_working_set}) exceeds "
+                f"Subgraph {sg_idx}: joint working set ({joint_ws}) + "
+                f"prev retained ({prev_retained_size}) = {total_ws} exceeds "
                 f"fast memory ({fast_mem}) — OOM! [w={w},h={h},k={k}]"
             )
 
     # --- Check graph outputs are NOT retained at the end ---
-    # All graph outputs must end up in slow memory
+    # All graph outputs must end up in slow memory (this is a hard constraint)
     if n_sg > 0:
         final_retain = set(tensors_to_retain[-1])
         retained_graph_outputs = final_retain & graph_outputs
         if retained_graph_outputs:
-            warnings.append(
+            errors.append(
                 f"Graph outputs {sorted(retained_graph_outputs)} are retained after last subgraph "
-                f"(should be evicted to slow memory)"
+                f"(must be evicted to slow memory)"
             )
 
     # --- Check subgraph_latencies are positive ---
@@ -254,9 +355,195 @@ def validate_solution(problem, solution):
         if lat <= 0:
             errors.append(f"Subgraph {i}: latency must be positive, got {lat}")
 
+    # --- Verify subgraph_latencies against independently computed roofline model ---
+    try:
+        computed_lats = compute_latency(problem, solution)
+        for i, (reported, computed) in enumerate(zip(subgraph_latencies, computed_lats)):
+            if computed > 0:
+                rel_err = abs(reported - computed) / computed
+                if rel_err > 0.01:  # 1% tolerance for floating-point differences
+                    warnings.append(
+                        f"Subgraph {i}: reported latency {reported:.2f} differs from "
+                        f"roofline model {computed:.2f} (rel error {rel_err:.2%})"
+                    )
+    except Exception as e:
+        warnings.append(f"Could not verify latencies against roofline model: {e}")
+
     reported_total = sum(subgraph_latencies)
     valid = len(errors) == 0
     return valid, errors, warnings, reported_total
+
+
+def compute_latency(problem, solution):
+    """
+    Independently compute latencies for all subgraphs using the roofline model.
+    Returns list of computed latencies per subgraph.
+
+    Model:
+      - Per step: latency = max(compute, mem_in + mem_out)
+      - traversal_orders=null → no intra-subgraph spatial data reuse
+      - traversal_orders=[perm] → MatMul LHS reused when row unchanged, RHS when col unchanged
+      - split-K: LHS loaded once per spatial tile, RHS per k-step, output accumulator stays
+    """
+    widths = problem["widths"]
+    heights = problem["heights"]
+    inputs_list = problem["inputs"]
+    outputs_list = problem["outputs"]
+    base_costs = problem["base_costs"]
+    op_types = problem["op_types"]
+    slow_bw = problem["slow_memory_bandwidth"]
+    native_w, native_h = problem["native_granularity"]
+    num_ops = len(base_costs)
+
+    subgraphs = solution["subgraphs"]
+    granularities = solution["granularities"]
+    tensors_to_retain = solution["tensors_to_retain"]
+    traversal_orders = solution["traversal_orders"]
+    n_sg = len(subgraphs)
+
+    # Precompute: tensor_producer, graph_inputs, graph_outputs
+    tensor_producer = {}
+    all_produced = set()
+    all_consumed = set()
+    for op_id in range(num_ops):
+        for t in outputs_list[op_id]:
+            tensor_producer[t] = op_id
+            all_produced.add(t)
+        for t in inputs_list[op_id]:
+            all_consumed.add(t)
+    graph_outputs = set(range(len(widths))) - all_consumed
+
+    computed_latencies = []
+
+    for sg_idx in range(n_sg):
+        sg_ops = subgraphs[sg_idx]
+        w, h, k = granularities[sg_idx]
+        trav = traversal_orders[sg_idx]
+        op_set = set(sg_ops)
+        prev_retained = set(tensors_to_retain[sg_idx - 1]) if sg_idx > 0 else set()
+        curr_retained = set(tensors_to_retain[sg_idx])
+
+        # Identify ephemeral tensors: produced AND consumed within subgraph.
+        # External consumers don't prevent ephemeral status — they're served
+        # by tensors_to_retain (if retained) or recomputation (if discarded).
+        ephemeral = set()
+        for op_id in sg_ops:
+            for t_id in outputs_list[op_id]:
+                if t_id in graph_outputs:
+                    continue
+                has_consumer_in_sg = any(
+                    t_id in inputs_list[op2] for op2 in sg_ops if op2 != op_id
+                )
+                if has_consumer_in_sg:
+                    ephemeral.add(t_id)
+
+        # Determine spatial dimensions from output tensors
+        max_W, max_H = 0, 0
+        for op_id in sg_ops:
+            for t_id in outputs_list[op_id]:
+                max_W = max(max_W, widths[t_id])
+                max_H = max(max_H, heights[t_id])
+
+        n_tiles_w = math.ceil(max_W / w) if max_W > 0 else 1
+        n_tiles_h = math.ceil(max_H / h) if max_H > 0 else 1
+        n_tiles = n_tiles_w * n_tiles_h
+
+        # Determine K (reduction dimension) from MatMul LHS inputs
+        K = 0
+        for op_id in sg_ops:
+            if op_types[op_id] == "MatMul":
+                lhs_t = inputs_list[op_id][0]
+                K = max(K, widths[lhs_t])
+        n_k = max(1, math.ceil(K / k)) if K > 0 else 1
+
+        # Compute cost per step (with native granularity padding)
+        pad = math.ceil(w / native_w) * math.ceil(h / native_h)
+        matmul_compute_per_step = sum(
+            base_costs[op_id] * pad / n_k
+            for op_id in sg_ops if op_types[op_id] == "MatMul"
+        )
+        pointwise_compute = sum(
+            base_costs[op_id] * pad
+            for op_id in sg_ops if op_types[op_id] != "MatMul"
+        )
+
+        # Classify unique boundary input tensors
+        # Each entry: (role, first_k_load, mid_k_load)
+        #   mm_lhs: load widths[t]*h once per tile, 0 on subsequent k-steps
+        #   mm_rhs: load w*k every k-step
+        #   pw_input: load w*h once per tile, 0 on subsequent k-steps
+        boundary_inputs = {}  # t_id -> (role, first_k_load, mid_k_load)
+        for op_id in sg_ops:
+            for i, t_id in enumerate(inputs_list[op_id]):
+                if t_id in ephemeral or t_id in prev_retained or t_id in boundary_inputs:
+                    continue
+                if op_types[op_id] == "MatMul":
+                    if i == 0:  # LHS
+                        boundary_inputs[t_id] = ("mm_lhs", widths[t_id] * h, 0)
+                    else:  # RHS
+                        boundary_inputs[t_id] = ("mm_rhs", w * k, w * k)
+                else:
+                    boundary_inputs[t_id] = ("pw_input", w * h, 0)
+
+        # Classify boundary output tensors (non-ephemeral, non-retained)
+        boundary_output_size = 0
+        for op_id in sg_ops:
+            for t_id in outputs_list[op_id]:
+                if t_id not in ephemeral and t_id not in curr_retained:
+                    boundary_output_size += w * h
+
+        # Build traversal sequence
+        tile_seq = trav if trav is not None else list(range(n_tiles))
+        has_reuse = trav is not None
+
+        # Execute tiles and accumulate latency
+        total_latency = 0.0
+        prev_row, prev_col = -1, -1
+
+        for tile_pos, tile_idx in enumerate(tile_seq):
+            row = tile_idx // n_tiles_w
+            col = tile_idx % n_tiles_w
+
+            for kstep in range(n_k):
+                # Compute
+                compute = matmul_compute_per_step
+                if kstep == n_k - 1:
+                    compute += pointwise_compute
+
+                # Memory in
+                mem_in = 0.0
+                for t_id, (role, first_load, mid_load) in boundary_inputs.items():
+                    if kstep == 0:
+                        # First k-step: check spatial reuse
+                        if role == "mm_lhs":
+                            if has_reuse and tile_pos > 0 and row == prev_row:
+                                pass  # Reuse LHS (same row)
+                            else:
+                                mem_in += first_load
+                        elif role == "mm_rhs":
+                            if has_reuse and tile_pos > 0 and col == prev_col:
+                                pass  # Reuse RHS (same col)
+                            else:
+                                mem_in += first_load
+                        else:  # pw_input
+                            mem_in += first_load
+                    else:
+                        mem_in += mid_load  # Only RHS loads on mid k-steps
+
+                # Memory out (only on last k-step)
+                mem_out = 0.0
+                if kstep == n_k - 1:
+                    mem_out = boundary_output_size
+
+                mem_time = (mem_in + mem_out) / slow_bw
+                step_latency = max(compute, mem_time)
+                total_latency += step_latency
+
+            prev_row, prev_col = row, col
+
+        computed_latencies.append(total_latency)
+
+    return computed_latencies
 
 
 def run_benchmark(binary, benchmark_path, output_path, timeout_sec, num_cores=8):
@@ -264,9 +551,18 @@ def run_benchmark(binary, benchmark_path, output_path, timeout_sec, num_cores=8)
     try:
         env = os.environ.copy()
         env["OMP_NUM_THREADS"] = str(num_cores)
+        # Pin to first N cores with taskset for faithful competition simulation
+        # (competition runs on an 8-core machine; without affinity, a >8-core
+        # host lets the process spread across more cores than allowed).
+        import shutil
+        cmd = [binary, benchmark_path, output_path]
+        if shutil.which("taskset"):
+            # Build CPU mask: cores 0..num_cores-1
+            mask = (1 << num_cores) - 1
+            cmd = ["taskset", f"0x{mask:x}"] + cmd
         start = time.time()
         result = subprocess.run(
-            [binary, benchmark_path, output_path],
+            cmd,
             capture_output=True,
             text=True,
             timeout=timeout_sec + 1,  # +1s grace for I/O
