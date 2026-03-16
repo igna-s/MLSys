@@ -32,6 +32,30 @@ COPY v17/main.cpp v17/scheduler.cpp v17/scheduler.h ./
 COPY nlohmann/ ./nlohmann/
 RUN g++ -O3 -std=c++20 -static -fopenmp -I. main.cpp scheduler.cpp -o mlsys && strip mlsys
 
+# Build V18
+WORKDIR /build/v18
+COPY v18/main.cpp v18/scheduler.cpp v18/scheduler.h ./
+COPY nlohmann/ ./nlohmann/
+RUN g++ -O3 -std=c++20 -static -fopenmp -I. main.cpp scheduler.cpp -o mlsys && strip mlsys
+
+# Build V19
+WORKDIR /build/v19
+COPY v19/main.cpp v19/scheduler.cpp v19/scheduler.h ./
+COPY nlohmann/ ./nlohmann/
+RUN g++ -O3 -std=c++20 -static -fopenmp -I. main.cpp scheduler.cpp -o mlsys && strip mlsys
+
+# Build V20
+WORKDIR /build/v20
+COPY v20/main.cpp v20/scheduler.cpp v20/scheduler.h ./
+COPY nlohmann/ ./nlohmann/
+RUN g++ -O3 -std=c++20 -static -fopenmp -I. main.cpp scheduler.cpp -o mlsys && strip mlsys
+
+# Build V21
+WORKDIR /build/v21
+COPY v21/main.cpp v21/scheduler.cpp v21/scheduler.h ./
+COPY nlohmann/ ./nlohmann/
+RUN g++ -O3 -std=c++20 -static -fopenmp -I. main.cpp scheduler.cpp -o mlsys && strip mlsys
+
 # Final image with all binaries + benchmarks + evaluator
 FROM ubuntu:22.04
 RUN apt-get update && apt-get install -y python3 && rm -rf /var/lib/apt/lists/*
@@ -42,6 +66,10 @@ COPY --from=builder /build/v14/mlsys /app/bin/mlsys_v14
 COPY --from=builder /build/v15/mlsys /app/bin/mlsys_v15
 COPY --from=builder /build/v16/mlsys /app/bin/mlsys_v16
 COPY --from=builder /build/v17/mlsys /app/bin/mlsys_v17
+COPY --from=builder /build/v18/mlsys /app/bin/mlsys_v18
+COPY --from=builder /build/v19/mlsys /app/bin/mlsys_v19
+COPY --from=builder /build/v20/mlsys /app/bin/mlsys_v20
+COPY --from=builder /build/v21/mlsys /app/bin/mlsys_v21
 
 COPY benchmarks/ /app/benchmarks/
 COPY evaluate.py /app/evaluate.py

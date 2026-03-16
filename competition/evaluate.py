@@ -40,7 +40,7 @@ TIMEOUTS = {
     "mlsys-2026-17": 60, "mlsys-2026-18": 60, "mlsys-2026-19": 60, "mlsys-2026-20": 60,
 }
 
-VERSIONS = ["v10", "v16", "v17"]
+VERSIONS = ["v21"]
 CORE_CONFIGS = [1, 8]  # Run each version with 1 core and 8 cores
 BIN_DIR = "/app/bin"
 BENCH_DIR = "/app/benchmarks"
