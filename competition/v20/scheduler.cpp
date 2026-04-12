@@ -6,7 +6,7 @@
 // 5. Precomputed total_fanout for chain-aware mode
 // 6. Larger W_max for each size class (22 for N≤65, 16 for N≤105)
 
-#include "scheduler.h"
+#include "mlsys.h"
 #include <algorithm>
 #include <cmath>
 #include <climits>
@@ -24,7 +24,10 @@
 #include <omp.h>
 #endif
 
-namespace mlsys_solver {
+namespace mlsys {
+
+// Tensor size helper (mlsys::Tensor has no .size() method)
+static inline int64_t tsize(const Tensor& t) { return t.width * t.height; }
 
 static inline int64_t ceildiv(int64_t a, int64_t b) { return (a + b - 1) / b; }
 
@@ -116,7 +119,7 @@ static SubgraphTensorInfo precompute_sg_tensors(
 
     for (size_t oi : ops) {
         auto& op = p.ops[oi];
-        if (op.op_type_enum == OpType::MatMul) {
+        if (op.op_type == "MatMul") {
             si.has_mm = true;
             si.K_dim = std::max(si.K_dim, p.tensors[op.inputs[0]].width);
             si.mm_base += (double)op.base_cost;
@@ -160,11 +163,11 @@ static SubgraphTensorInfo precompute_sg_tensors(
         int64_t actual_K = si.K_dim;
         for (size_t oi : ops) {
             auto& op = p.ops[oi];
-            if (op.op_type_enum == OpType::MatMul && op.inputs.size() >= 2) {
+            if (op.op_type == "MatMul" && op.inputs.size() >= 2) {
                 if (op.inputs[0] == t) { l = true; actual_K = p.tensors[t].width; }
                 if (op.inputs[1] == t) { r = true; actual_K = p.tensors[t].height; }
             }
-            if (op.op_type_enum == OpType::Pointwise) {
+            if (op.op_type == "Pointwise") {
                 for (auto ti : op.inputs) if (ti == t) pw = true;
                 for (auto to : op.outputs) if (to == t) pw = true;
             }
@@ -177,7 +180,7 @@ static SubgraphTensorInfo precompute_sg_tensors(
     std::set<size_t> _mm_lhs, _mm_rhs, _pw_in, _out;
     for (size_t oi : ops) {
         auto& op = p.ops[oi];
-        if (op.op_type_enum == OpType::MatMul) {
+        if (op.op_type == "MatMul") {
             if (op.inputs.size() >= 2) {
                 if (!si.eph.count(op.inputs[0])) _mm_lhs.insert(op.inputs[0]);
                 if (!si.eph.count(op.inputs[1])) _mm_rhs.insert(op.inputs[1]);
@@ -330,7 +333,7 @@ static Best find_best(const Problem& p, const std::vector<size_t>& ops,
     // Compute resident_full_size early (needed for memory-aware combos)
     int64_t resident_full_size = 0;
     for (size_t t = 0; t < p.tensors.size(); ++t) {
-        if (res.count(t)) resident_full_size += p.tensors[t].size();
+        if (res.count(t)) resident_full_size += tsize(p.tensors[t]);
     }
 
     std::set<int64_t> all_dims;
@@ -431,7 +434,7 @@ static Best find_best(const Problem& p, const std::vector<size_t>& ops,
         }
         for (size_t oi : ops) {
             auto& op = p.ops[oi];
-            if (op.op_type_enum == OpType::MatMul && op.inputs.size() >= 2) {
+            if (op.op_type == "MatMul" && op.inputs.size() >= 2) {
                 int64_t thisK = p.tensors[op.inputs[0]].width;
                 for (int64_t v = 16; v <= thisK; v *= 2) kset.insert(v);
                 kset.insert(thisK);
@@ -671,7 +674,7 @@ Solution Solve(const Problem& problem) {
                     struct RC { size_t i; int64_t s; };
                     std::vector<RC> rc;
                     for (size_t t : sg_tensors_vec) if (lu[t] > sg_last_common)
-                        rc.push_back({t, problem.tensors[t].size()});
+                        rc.push_back({t, tsize(problem.tensors[t])});
                     std::sort(rc.begin(), rc.end(), [](const RC& a, const RC& b) { return a.s > b.s; });
                     int64_t bud = problem.fast_memory_capacity;
                     for (auto& c : rc) if (bud >= c.s) { rl.push_back(c.i); rs.insert(c.i); bud -= c.s; }
@@ -683,7 +686,7 @@ Solution Solve(const Problem& problem) {
                     struct RC { size_t i; int64_t s; double score; };
                     std::vector<RC> rc;
                     for (size_t t : sg_tensors_vec) if (lu[t] > sg_last_common) {
-                        int64_t s = problem.tensors[t].size();
+                        int64_t s = tsize(problem.tensors[t]);
                         // Find first use of t after the current subgraph end (i-1)
                         int next_use = lu[t];
                         for (int k2 = i; k2 <= lu[t] && k2 < N; ++k2) {
@@ -711,7 +714,7 @@ Solution Solve(const Problem& problem) {
                             if (next_use >= 0) break;
                         }
                         if (next_use >= 0)
-                            rc.push_back({t, problem.tensors[t].size(), next_use});
+                            rc.push_back({t, tsize(problem.tensors[t]), next_use});
                     }
                     std::sort(rc.begin(), rc.end(), [](const RC& a, const RC& b) { return a.nu < b.nu; });
                     int64_t bud = problem.fast_memory_capacity * 3 / 4;
@@ -723,7 +726,7 @@ Solution Solve(const Problem& problem) {
                     struct RC { size_t i; int64_t s; int fanout; };
                     std::vector<RC> rc;
                     for (size_t t : sg_tensors_vec) if (lu[t] > sg_last_common) {
-                        rc.push_back({t, problem.tensors[t].size(), total_fanout[t]});
+                        rc.push_back({t, tsize(problem.tensors[t]), total_fanout[t]});
                     }
                     std::sort(rc.begin(), rc.end(), [](const RC& a, const RC& b) {
                         if (a.fanout != b.fanout) return a.fanout > b.fanout;
@@ -739,7 +742,7 @@ Solution Solve(const Problem& problem) {
                     struct RC { size_t i; int64_t s; int last_use; };
                     std::vector<RC> rc;
                     for (size_t t : sg_tensors_vec) if (lu[t] > sg_last_common) {
-                        rc.push_back({t, problem.tensors[t].size(), lu[t]});
+                        rc.push_back({t, tsize(problem.tensors[t]), lu[t]});
                     }
                     std::sort(rc.begin(), rc.end(), [](const RC& a, const RC& b) {
                         return a.last_use < b.last_use;
@@ -753,7 +756,7 @@ Solution Solve(const Problem& problem) {
                     std::vector<RC> rc;
                     int64_t thresh = problem.fast_memory_capacity / 4;
                     for (size_t t : sg_tensors_vec) if (lu[t] > sg_last_common) {
-                        int64_t s = problem.tensors[t].size();
+                        int64_t s = tsize(problem.tensors[t]);
                         if (s <= thresh) rc.push_back({t, s});
                     }
                     std::sort(rc.begin(), rc.end(), [](const RC& a, const RC& b) { return a.s < b.s; });
@@ -771,7 +774,7 @@ Solution Solve(const Problem& problem) {
                             if (next_use >= 0) break;
                         }
                         if (next_use >= 0)
-                            rc.push_back({t, problem.tensors[t].size(), next_use});
+                            rc.push_back({t, tsize(problem.tensors[t]), next_use});
                     }
                     std::sort(rc.begin(), rc.end(), [](const RC& a, const RC& b) { return a.nu < b.nu; });
                     int64_t bud = problem.fast_memory_capacity;
@@ -782,7 +785,7 @@ Solution Solve(const Problem& problem) {
                     struct RC { size_t i; int64_t s; };
                     std::vector<RC> rc;
                     for (size_t t : sg_tensors_vec) if (lu[t] > sg_last_common)
-                        rc.push_back({t, problem.tensors[t].size()});
+                        rc.push_back({t, tsize(problem.tensors[t])});
                     std::sort(rc.begin(), rc.end(), [](const RC& a, const RC& b) { return a.s < b.s; });
                     int64_t bud = problem.fast_memory_capacity;
                     for (auto& c : rc) if (bud >= c.s) { rl.push_back(c.i); rs.insert(c.i); bud -= c.s; }
@@ -803,7 +806,7 @@ Solution Solve(const Problem& problem) {
                                 for (auto t2 : problem.ops[k2].inputs) if (t2 == t) { next_use = k2; break; }
                                 if (next_use >= 0) break;
                             }
-                            rc.push_back({t, problem.tensors[t].size(), next_use});
+                            rc.push_back({t, tsize(problem.tensors[t]), next_use});
                         }
                     }
                     std::sort(rc.begin(), rc.end(), [](const RC& a, const RC& b) { return a.nu < b.nu; });
@@ -821,7 +824,7 @@ Solution Solve(const Problem& problem) {
                             if (next_use >= 0) break;
                         }
                         if (next_use >= 0)
-                            rc.push_back({t, problem.tensors[t].size(), next_use});
+                            rc.push_back({t, tsize(problem.tensors[t]), next_use});
                     }
                     std::sort(rc.begin(), rc.end(), [](const RC& a, const RC& b) { return a.nu < b.nu; });
                     int64_t bud = problem.fast_memory_capacity / 2;
@@ -865,7 +868,7 @@ Solution Solve(const Problem& problem) {
                 if (!rmode_results[rmode].valid) continue;
                 auto& r = rmode_results[rmode];
                 int64_t ret_size = 0;
-                for (auto t : r.ret) ret_size += problem.tensors[t].size();
+                for (auto t : r.ret) ret_size += tsize(problem.tensors[t]);
                 if (ret_size > problem.fast_memory_capacity) continue;
                 if (r.tot < dp[i]) {
                     dp[i] = r.tot; par[i] = j;
@@ -898,11 +901,13 @@ Solution Solve(const Problem& problem) {
         int p_ = par[cur]; Subgraph sg;
         for (int k = p_; k < cur; ++k) sg.ops.push_back(k);
         sg.granularity = {info[cur].w, info[cur].h, info[cur].k};
-        sg.traversal_order = info[cur].tr; sg.subgraph_latency = info[cur].lat;
+        if (info[cur].tr.empty()) sg.traversal_order = std::nullopt;
+        else sg.traversal_order = info[cur].tr;
+        sg.subgraph_latency = info[cur].lat;
         sg.tensors_to_retain = info[cur].ret; sgs.push_back(sg); cur = p_;
     }
     std::reverse(sgs.begin(), sgs.end());
     Solution sol; sol.subgraphs = sgs; return sol;
 }
 
-} // namespace mlsys_solver
+} // namespace mlsys

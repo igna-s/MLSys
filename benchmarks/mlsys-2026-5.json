@@ -54,7 +54,7 @@
     "MatMul", "Pointwise", "MatMul", "MatMul", "Pointwise",
     "Pointwise", "Pointwise", "Pointwise", "Pointwise"
   ],
-  "fast_memory_capacity": 30000,
+  "fast_memory_capacity": 30000, 
   "slow_memory_bandwidth": 15,
   "native_granularity": [128, 128]
 }

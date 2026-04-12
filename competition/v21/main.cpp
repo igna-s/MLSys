@@ -3,13 +3,19 @@
 #include <string>
 #include <vector>
 #include <algorithm>
-#include "scheduler.h"
+#include "mlsys.h"
 #include <nlohmann/json.hpp> // Needs nlohmann/json
 
 using json = nlohmann::json;
-using namespace mlsys_solver;
+using namespace mlsys;
 
-Problem ReadProblem(const std::string& filename) {
+// Forward declaration of the solver (defined in scheduler.cpp)
+namespace mlsys { Solution Solve(const Problem& problem); }
+
+// Local JSON reader/writer. (The official mlsys::ReadProblem / mlsys::ReadSolution
+// are provided by the contest infrastructure; here we implement the JSON I/O
+// ourselves so the binary runs standalone.)
+static Problem ReadProblemJson(const std::string& filename) {
     std::ifstream f(filename);
     if (!f.is_open()) {
         std::cerr << "Could not open file: " << filename << std::endl;
@@ -38,7 +44,6 @@ Problem ReadProblem(const std::string& filename) {
     for (size_t i = 0; i < inputs.size(); ++i) {
         Op op;
         op.op_type = op_types[i];
-        op.op_type_enum = (op.op_type == "MatMul") ? OpType::MatMul : OpType::Pointwise;
         op.base_cost = base_costs[i];
 
         for (auto in : inputs[i]) op.inputs.push_back(in);
@@ -56,7 +61,7 @@ Problem ReadProblem(const std::string& filename) {
     return prob;
 }
 
-void WriteSolution(const Solution& sol, const std::string& filename) {
+static void WriteSolutionJson(const Solution& sol, const std::string& filename) {
     json j;
     j["subgraphs"] = json::array();
     j["granularities"] = json::array();
@@ -69,10 +74,10 @@ void WriteSolution(const Solution& sol, const std::string& filename) {
         j["granularities"].push_back({sg.granularity.width, sg.granularity.height, sg.granularity.depth});
         j["tensors_to_retain"].push_back(sg.tensors_to_retain);
 
-        if (sg.traversal_order.empty()) {
+        if (!sg.traversal_order.has_value()) {
             j["traversal_orders"].push_back(nullptr);
         } else {
-            j["traversal_orders"].push_back(sg.traversal_order);
+            j["traversal_orders"].push_back(*sg.traversal_order);
         }
 
         j["subgraph_latencies"].push_back(sg.subgraph_latency);
@@ -92,9 +97,9 @@ int main(int argc, char* argv[]) {
     std::string output_file = argv[2];
 
     try {
-        Problem problem = ReadProblem(input_file);
+        Problem problem = ReadProblemJson(input_file);
         Solution solution = Solve(problem);
-        WriteSolution(solution, output_file);
+        WriteSolutionJson(solution, output_file);
 
         std::cout << "Successfully generated schedule -> " << output_file << std::endl;
     } catch (const std::exception& e) {

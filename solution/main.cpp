@@ -23,7 +23,8 @@ Problem ReadProblem(const std::string& filename) {
     // Parse tensors
     auto widths = j["widths"];
     auto heights = j["heights"];
-    for (size_t i = 0; i < widths.size(); ++i) {
+    size_t n_tensors = std::min(widths.size(), heights.size());
+    for (size_t i = 0; i < n_tensors; ++i) {
         prob.tensors.push_back({widths[i], heights[i]});
     }
 
