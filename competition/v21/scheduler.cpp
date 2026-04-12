@@ -1,10 +1,12 @@
-// V20 improvements over V19:
-// 1. Time-budget adaptive DP window: W_max (larger) used when fast, W_cons (v19 fallback) when slow
-// 2. New retention modes 1 (value-based: size/distance), 3 (chain-aware: fan-out), 4 (lu-distance)
-// 3. More retention modes for medium-N: 8 modes for N≤65 (was 5), 8 for N≤40 (was 6)
-// 4. Memory-aware combo generation extended from N<32 to N<65
-// 5. Precomputed total_fanout for chain-aware mode
-// 6. Larger W_max for each size class (22 for N≤65, 16 for N≤105)
+// V21 improvements over V19/V20:
+// V20: Time-budget adaptive DP window: W_max (larger) used when fast, W_cons (v19 fallback) when slow
+// V20: New retention modes 1 (value-based: size/distance), 3 (chain-aware: fan-out), 4 (lu-distance)
+// V20: More retention modes for medium-N: 8 modes for N≤65 (was 5), 8 for N≤40 (was 6)
+// V20: Memory-aware combo generation extended from N<32 to N<65
+// V20: Precomputed total_fanout for chain-aware mode
+// V20: Larger W_max for each size class (20 for N≤65, 16 for N≤105)
+// V21: Operator recomputation — for small subgraphs (≤4 ops), prepend cheap Pointwise producers
+//      whose recompute cost < tsize(t)/2; evaluate both base and extended subgraph, keep cheaper
 
 #include "mlsys.h"
 #include <algorithm>
@@ -586,6 +588,7 @@ Solution Solve(const Problem& problem) {
 
 #ifdef _OPENMP
     omp_set_max_active_levels(1);
+    omp_set_num_threads(8);
 #endif
 
     // V20: Timer for adaptive window selection

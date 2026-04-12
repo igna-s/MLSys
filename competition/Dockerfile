@@ -46,13 +46,15 @@ RUN g++ -O3 -std=c++20 -static -fopenmp -I. main.cpp scheduler.cpp -o mlsys && s
 
 # Build V20
 WORKDIR /build/v20
-COPY v20/main.cpp v20/scheduler.cpp v20/scheduler.h ./
+COPY v20/main.cpp v20/scheduler.cpp v20/mlsys.h ./
+COPY v20/third_party/ ./third_party/
 COPY nlohmann/ ./nlohmann/
 RUN g++ -O3 -std=c++20 -static -fopenmp -I. main.cpp scheduler.cpp -o mlsys && strip mlsys
 
 # Build V21
 WORKDIR /build/v21
-COPY v21/main.cpp v21/scheduler.cpp v21/scheduler.h ./
+COPY v21/main.cpp v21/scheduler.cpp v21/mlsys.h ./
+COPY v21/third_party/ ./third_party/
 COPY nlohmann/ ./nlohmann/
 RUN g++ -O3 -std=c++20 -static -fopenmp -I. main.cpp scheduler.cpp -o mlsys && strip mlsys
 
